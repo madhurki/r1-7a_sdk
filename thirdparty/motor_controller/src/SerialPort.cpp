@@ -12,8 +12,14 @@
 #include <sys/select.h>
 #ifdef __linux__
 #include <linux/serial.h>
-#if defined(TCGETS2) && !defined(BOTHER)
-struct termios2 {
+/*
+ * Own termios2 definition + ioctl numbers so the build does not depend on
+ * which libc/kernel headers define struct termios2, TCGETS2 or BOTHER
+ * (glibc >= 2.42 changed this). Layout matches the kernel's asm-generic
+ * struct termios2: 44 bytes on x86_64 and aarch64.
+ */
+#include <asm/ioctl.h>
+struct r1_termios2 {
     tcflag_t c_iflag;
     tcflag_t c_oflag;
     tcflag_t c_cflag;
@@ -23,8 +29,12 @@ struct termios2 {
     speed_t c_ispeed;
     speed_t c_ospeed;
 };
-#define BOTHER 0x00001000
-#endif
+static_assert(sizeof(r1_termios2) == 44, "unexpected termios2 layout");
+#define R1_TCGETS2 _IOR('T', 0x2A, struct r1_termios2)
+#define R1_TCSETS2 _IOW('T', 0x2B, struct r1_termios2)
+#define R1_BOTHER  0x00001000
+#define R1_CBAUD   0x0000100F
+#define R1_HAVE_TERMIOS2 1
 #endif
 #endif
 
@@ -224,15 +234,15 @@ void SerialPort::configurePort(int baudrate, double timeout) {
         ioctl(m_fd, TIOCSSERIAL, &sc);
     }
 
-#if defined(TCGETS2)
+#if defined(R1_HAVE_TERMIOS2)
     if (non_standard_baud) {
-        struct termios2 t2 {};
-        if (ioctl(m_fd, TCGETS2, &t2) == 0) {
-            t2.c_cflag &= ~CBAUD;
-            t2.c_cflag |= BOTHER;
+        struct r1_termios2 t2 {};
+        if (ioctl(m_fd, R1_TCGETS2, &t2) == 0) {
+            t2.c_cflag &= ~R1_CBAUD;
+            t2.c_cflag |= R1_BOTHER;
             t2.c_ispeed = baudrate;
             t2.c_ospeed = baudrate;
-            if (ioctl(m_fd, TCSETS2, &t2) != 0) {
+            if (ioctl(m_fd, R1_TCSETS2, &t2) != 0) {
                 throw std::runtime_error(
                     std::string("TCSETS2 failed for baudrate ") +
                     std::to_string(baudrate) + ": " + strerror(errno));
