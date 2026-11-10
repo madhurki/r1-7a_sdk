@@ -29,8 +29,12 @@ add_executable(demo_arm_motion
   src/demo_arm_motion.cpp
   src/arm_motor_bus.cpp
 )
+add_executable(move_ab
+  src/move_ab.cpp
+  src/arm_motor_bus.cpp
+)
 
-foreach(tgt test_arm_lowlevel demo_arm_motion)
+foreach(tgt test_arm_lowlevel demo_arm_motion move_ab)
   target_include_directories(${tgt} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${MOTOR_CONTROLLER_ROOT}/include
@@ -42,7 +46,7 @@ foreach(tgt test_arm_lowlevel demo_arm_motion)
 endforeach()
 
 set_target_properties(
-  test_arm_lowlevel demo_arm_motion
+  test_arm_lowlevel demo_arm_motion move_ab
   PROPERTIES
   BUILD_RPATH "${MOTOR_CONTROLLER_ROOT}/lib"
   INSTALL_RPATH "$ORIGIN/../thirdparty/motor_controller/lib"
