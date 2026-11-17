@@ -5,6 +5,13 @@
 // acceleration at both ends. Duration is chosen so the fastest joint never
 // exceeds --vmax rad/s. Position + velocity feed-forward is sent every tick.
 //
+// Gravity compensation (--gcomp F): a feed-forward torque F x (model gravity torque) is added
+// every tick, using link masses and centres of mass from Unitree's URDF. It removes the lag
+// against gravity that otherwise makes the shoulder trail and then catch up.
+//
+// Ctrl-C (not a fault) drives the arm back to A along a smooth profile before releasing;
+// a second Ctrl-C releases immediately.
+//
 // Safety: targets are checked against URDF limits (minus a margin), tracking
 // error above --max-err aborts, any motor fault/mode drop aborts, Ctrl-C
 // aborts. On abort/finish the arm holds its measured pose briefly, then
@@ -33,6 +40,69 @@ using clock_t_ = std::chrono::steady_clock;
 constexpr JointArray kLower = {-2.723f, 0.f, -0.349f, 0.f, -2.269f, -0.785f, -1.571f};
 constexpr JointArray kUpper = {2.723f, 3.1416f, 3.491f, 3.1415f, 2.269f, 0.785f, 1.571f};
 
+// Kinematic and mass parameters from Unitree URDF V1.2, right arm (urdf/URDF_R1-7A.tar.gz).
+constexpr float kJointXyz[7][3] = {{0.0f, 0.0f, 0.069f}, {0.0f, 0.0f, 0.0469f}, {0.0f, 0.1085f, -0.0047926f}, {0.025f, 0.082408f, 0.016191f}, {-0.022314f, -0.10786f, 0.062877f}, {-1.1462e-05f, -0.1072f, 0.00069991f}, {0.0f, -0.01f, 0.0f}};
+constexpr float kJointRpy[7][3] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {-0.017453f, 0.0f, 0.0f}, {0.0f, -0.016375f, 0.0f}, {-3.1416f, 0.0f, -3.1416f}};
+constexpr float kJointAxis[7][3] = {{0.0f, 0.0f, -1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+constexpr float kLinkMass[7] = {0.89452f, 0.74773f, 0.71845f, 0.85572f, 0.59294f, 0.391f, 0.1048f};  // Link1..Link7, kg
+constexpr float kLinkCom[7][3] = {{2.156e-08f, -9.6233e-09f, 0.045314f}, {0.0017013f, 0.063321f, -0.0042531f}, {-0.0062069f, 0.075751f, 0.012556f}, {-0.020915f, -0.070455f, 0.060056f}, {0.00042498f, -0.043121f, 0.00020709f}, {-1.3033e-07f, -0.0098039f, 8.3267e-17f}, {-3.7143e-07f, -0.018577f, 0.00595f}};  // in each link frame, m
+
+void rpyToR(const float* r, float* R) {  // R = Rz(y) Ry(p) Rx(r), row-major
+    const float cr = std::cos(r[0]), sr = std::sin(r[0]), cp = std::cos(r[1]), sp = std::sin(r[1]),
+                cy = std::cos(r[2]), sy = std::sin(r[2]);
+    const float M[9] = {cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr,
+                        sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr,
+                        -sp, cp * sr, cp * cr};
+    std::memcpy(R, M, sizeof(M));
+}
+void axisAngleToR(const float* a, float t, float* R) {
+    const float c = std::cos(t), s = std::sin(t), C = 1.f - c, x = a[0], y = a[1], z = a[2];
+    const float M[9] = {x * x * C + c, x * y * C - z * s, x * z * C + y * s,
+                        y * x * C + z * s, y * y * C + c, y * z * C - x * s,
+                        z * x * C - y * s, z * y * C + x * s, z * z * C + c};
+    std::memcpy(R, M, sizeof(M));
+}
+void mul33(const float* A, const float* B, float* C) {
+    float T[9];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) T[i * 3 + j] = A[i * 3] * B[j] + A[i * 3 + 1] * B[3 + j] + A[i * 3 + 2] * B[6 + j];
+    std::memcpy(C, T, sizeof(T));
+}
+void mulv(const float* R, const float* v, float* o) {
+    for (int i = 0; i < 3; ++i) o[i] = R[i * 3] * v[0] + R[i * 3 + 1] * v[1] + R[i * 3 + 2] * v[2];
+}
+
+// Torque each joint must supply to hold the arm still against gravity at pose q (URDF sign, Nm).
+JointArray gravityTorque(const JointArray& q) {
+    float R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, p[3] = {0, 0, 0};
+    float jp[7][3], jz[7][3], cw[7][3];
+    for (int i = 0; i < kArmJointCount; ++i) {
+        float Ro[9], Rj[9], d[3], Ra[9];
+        rpyToR(kJointRpy[i], Ro);
+        mulv(R, kJointXyz[i], d);
+        for (int k = 0; k < 3; ++k) p[k] += d[k];
+        mul33(R, Ro, Rj);
+        mulv(Rj, kJointAxis[i], jz[i]);
+        std::memcpy(jp[i], p, sizeof(p));
+        axisAngleToR(kJointAxis[i], q[i], Ra);
+        mul33(Rj, Ra, R);
+        mulv(R, kLinkCom[i], d);
+        for (int k = 0; k < 3; ++k) cw[i][k] = p[k] + d[k];
+    }
+    JointArray tau{};
+    for (int k = 0; k < kArmJointCount; ++k) {
+        float t = 0.f;
+        for (int l = k; l < kArmJointCount; ++l) {
+            const float r[3] = {cw[l][0] - jp[k][0], cw[l][1] - jp[k][1], cw[l][2] - jp[k][2]};
+            const float f[3] = {0.f, 0.f, -9.81f * kLinkMass[l]};
+            const float m[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
+            t += m[0] * jz[k][0] + m[1] * jz[k][1] + m[2] * jz[k][2];
+        }
+        tau[k] = -t;  // the motor must cancel gravity's moment
+    }
+    return tau;
+}
+
 std::atomic<bool> g_running{true};
 void onSignal(int) { g_running = false; }
 
@@ -55,6 +125,9 @@ struct Options {
     int dwell_ms = 1000;     // pause at each end
     int rate_hz = 100;
     bool hold_end = false;   // hold final pose until Ctrl-C
+    bool one_way = false;    // go A -> B, hold at B until Ctrl-C, then return to A
+    float gcomp = 0.f;       // gravity feed-forward scale (0 = off, 1 = full model)
+    bool model_only = false; // print model gravity torques for --b and exit
 };
 
 void usage(const char* a0) {
@@ -72,7 +145,11 @@ void usage(const char* a0) {
         << "  --cycles N        A->B->A round trips (default 1)\n"
         << "  --dwell-ms N      pause at each end (default 1000)\n"
         << "  --rate N          control rate Hz (default 100)\n"
-        << "  --hold-end        hold final pose until Ctrl-C\n";
+        << "  --hold-end        hold final pose until Ctrl-C\n"
+        << "  --one-way         go A -> B and hold there; Ctrl-C returns smoothly to A\n"
+        << "  --gcomp F         gravity compensation scale, 0..1.2 (default 0 = off; try 1.0)\n"
+        << "  --model q0..q6    print the model's gravity torques at q and exit (no arm needed)\n"
+        << "Ctrl-C during a move or hold returns smoothly to A; press it again to release at once.\n";
 }
 
 bool read7(int& i, int argc, char** argv, JointArray& out) {
@@ -103,13 +180,20 @@ bool parse(int argc, char** argv, Options& o) {
         else if (s == "--dwell-ms" && v) o.dwell_ms = std::stoi(argv[++i]);
         else if (s == "--rate" && v) o.rate_hz = std::stoi(argv[++i]);
         else if (s == "--hold-end") o.hold_end = true;
+        else if (s == "--one-way") o.one_way = true;
+        else if (s == "--gcomp" && v) o.gcomp = std::stof(argv[++i]);
+        else if (s == "--model") { if (!read7(i, argc, argv, o.b)) return false; o.model_only = true; }
         else { std::cerr << "Unknown/incomplete option: " << s << "\n"; usage(argv[0]); return false; }
     }
+    if (o.model_only) return true;
     if (o.hand == 0) { std::cerr << "Need -r or -l\n"; return false; }
     if (!o.a_set || !o.b_set) { std::cerr << "Need --a and --b/--b-rel\n"; return false; }
     o.vmax = std::clamp(o.vmax, 0.01f, 1.0f);
     o.rate_hz = std::clamp(o.rate_hz, 20, 500);
     o.cycles = std::max(1, o.cycles);
+    o.gcomp = std::clamp(o.gcomp, 0.f, 1.2f);
+    if (o.gcomp > 0.f && o.hand == 2)
+        std::cerr << "Note: the gravity model uses the right-arm URDF; check it before trusting it on a left arm.\n";
     return true;
 }
 
@@ -131,11 +215,12 @@ bool withinLimits(const char* tag, const JointArray& q, float margin) {
     return ok;
 }
 
-void sendCmd(ArmMotorBus& bus, const JointArray& q, const JointArray& dq, float kp, float kd) {
+void sendCmd(ArmMotorBus& bus, const JointArray& q, const JointArray& dq, float kp, float kd,
+             const JointArray& tau = JointArray{}) {
     std::array<ArmJointCmd, kArmJointCount> c{};
     for (int i = 0; i < kArmJointCount; ++i) {
         c[i].mode = 1; c[i].timed_out = false;
-        c[i].q = q[i]; c[i].dq = dq[i]; c[i].tau = 0.f;
+        c[i].q = q[i]; c[i].dq = dq[i]; c[i].tau = tau[i];
         c[i].kp = kp; c[i].kd = kd;
     }
     bus.step(c);
@@ -145,6 +230,14 @@ void sendStop(ArmMotorBus& bus) {
     std::array<ArmJointCmd, kArmJointCount> c{};
     for (auto& x : c) { x.mode = 0; x.timed_out = false; }
     bus.step(c);
+}
+
+JointArray gff(const Options& o, const JointArray& q) {
+    JointArray t{};
+    if (o.gcomp <= 0.f) return t;
+    const JointArray g = gravityTorque(q);
+    for (int i = 0; i < kArmJointCount; ++i) t[i] = o.gcomp * g[i];
+    return t;
 }
 
 JointArray measured(const ArmMotorBus& bus) {
@@ -190,7 +283,7 @@ int segment(ArmMotorBus& bus, const Options& o, const JointArray& from, const Jo
             q[i] = from[i] + (to[i] - from[i]) * s;
             dq[i] = (to[i] - from[i]) * ds;
         }
-        sendCmd(bus, q, dq, o.kp, o.kd);
+        sendCmd(bus, q, dq, o.kp, o.kd, gff(o, q));
         if (faulted(bus)) return 1;
         const JointArray m = measured(bus);
         for (int i = 0; i < kArmJointCount; ++i) {
@@ -216,10 +309,19 @@ int dwell(ArmMotorBus& bus, const Options& o, const JointArray& q, int ms) {
     const JointArray zero{};
     const auto period = std::chrono::microseconds(1000000 / o.rate_hz);
     const auto t0 = clock_t_::now();
-    auto next = t0;
+    auto next = t0, last_print = t0;
+    const JointArray ff = gff(o, q), model = gravityTorque(q);
     while (g_running && (ms < 0 || clock_t_::now() - t0 < std::chrono::milliseconds(ms))) {
-        sendCmd(bus, q, zero, o.kp, o.kd);
+        sendCmd(bus, q, zero, o.kp, o.kd, ff);
         if (faulted(bus)) return 1;
+        if (ms < 0 && clock_t_::now() - last_print >= std::chrono::seconds(1)) {
+            // While holding still, measured joint torque should match the gravity model.
+            const auto st = bus.states();
+            std::cout << std::fixed << std::setprecision(2) << "  hold  tau meas/model  j1 " << st[1].tau_est << "/"
+                      << model[1] << "  j2 " << st[2].tau_est << "/" << model[2] << "  j3 " << st[3].tau_est << "/"
+                      << model[3] << " Nm\n";
+            last_print = clock_t_::now();
+        }
         next += period;
         std::this_thread::sleep_until(next);
     }
@@ -232,17 +334,18 @@ void gentleRelease(ArmMotorBus& bus, const Options& o) {
     const JointArray zero{};
     const JointArray q = measured(bus);
     const auto period = std::chrono::microseconds(1000000 / o.rate_hz);
-    auto run = [&](int ms, float kp, float kd) {
+    const JointArray ff = gff(o, q);
+    auto run = [&](int ms, float kp, float kd, bool with_g) {
         const auto t0 = clock_t_::now();
         auto next = t0;
         while (clock_t_::now() - t0 < std::chrono::milliseconds(ms)) {
-            sendCmd(bus, q, zero, kp, kd);
+            sendCmd(bus, q, zero, kp, kd, with_g ? ff : zero);
             next += period;
             std::this_thread::sleep_until(next);
         }
     };
-    run(500, o.kp, o.kd);
-    run(1500, 0.f, std::max(o.kd, 2.f));
+    run(500, o.kp, o.kd, true);
+    run(1500, 0.f, std::max(o.kd, 2.f), false);
     for (int k = 0; k < 50; ++k) {
         sendStop(bus);
         std::this_thread::sleep_for(period);
@@ -258,6 +361,14 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::cerr << "Bad argument: " << e.what() << "\n";
         return 1;
+    }
+    if (o.model_only) {
+        const JointArray g = gravityTorque(o.b);
+        printPose("q            :", o.b);
+        std::cout << std::fixed << std::setprecision(3) << "gravity (Nm) :";
+        for (float x : g) std::cout << " " << x;
+        std::cout << "\n";
+        return 0;
     }
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -311,7 +422,7 @@ int main(int argc, char** argv) {
         const auto t0 = clock_t_::now();
         bool all = false;
         while (g_running && clock_t_::now() - t0 < std::chrono::seconds(1)) {
-            sendCmd(bus, start, zero, o.kp, o.kd);
+            sendCmd(bus, start, zero, o.kp, o.kd, gff(o, start));
             const auto s = bus.states();
             all = std::all_of(s.begin(), s.end(), [](const ArmJointState& x) { return x.mode == 1; });
             if (all) break;
@@ -330,18 +441,34 @@ int main(int argc, char** argv) {
     if (!o.a_current) rc = segment(bus, o, start, A, "Current -> A");
     if (rc == 0) rc = dwell(bus, o, A, o.dwell_ms);
     JointArray last = A;
-    for (int c = 0; rc == 0 && c < o.cycles; ++c) {
+    if (rc == 0 && o.one_way) {
+        rc = segment(bus, o, A, B, "  A -> B");
+        if (rc == 0) {
+            last = B;
+            std::cout << "Holding at B. Ctrl-C to return smoothly to A.\n";
+            rc = dwell(bus, o, B, -1);
+        }
+    }
+    for (int c = 0; !o.one_way && rc == 0 && c < o.cycles; ++c) {
         std::cout << "Cycle " << c + 1 << "/" << o.cycles << "\n";
         rc = segment(bus, o, A, B, "  A -> B");
         if (rc == 0) { last = B; rc = dwell(bus, o, B, o.dwell_ms); }
         if (rc == 0) rc = segment(bus, o, B, A, "  B -> A");
         if (rc == 0) { last = A; rc = dwell(bus, o, A, o.dwell_ms); }
     }
-    if (rc == 0 && o.hold_end) {
+    if (rc == 0 && o.hold_end && !o.one_way) {
         std::cout << "Holding final pose. Ctrl-C to release.\n";
         rc = dwell(bus, o, last, -1);
     }
 
+    if (rc == 2) {  // Ctrl-C, not a fault: bring the arm back to A under control first
+        g_running = true;
+        std::cout << "\nCtrl-C: returning smoothly to A (press Ctrl-C again to release now)\n";
+        const int r2 = segment(bus, o, measured(bus), A, "  -> A");
+        if (r2 == 0) dwell(bus, o, A, 300);
+        rc = (r2 == 1) ? 1 : 2;
+    }
+    (void)last;
     gentleRelease(bus, o);
     printPose("Final  :", measured(bus));
     bus.close();
