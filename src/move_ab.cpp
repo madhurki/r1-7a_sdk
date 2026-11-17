@@ -288,7 +288,12 @@ int main(int argc, char** argv) {
     printPose("Current:", start);
     printPose("A      :", A);
     printPose("B      :", B);
-    bool ok = withinLimits("A", A, o.margin) & withinLimits("B", B, o.margin);
+    // Targets must stay --margin inside the limits. When A is the current pose it only has to be
+    // inside the hard limits (with 0.05 rad slack for encoder noise): the folded rest pose sits
+    // exactly on the j1/j3 lower limit, and moving away from it must be allowed.
+    const bool a_ok = o.a_current ? withinLimits("A (current pose)", A, -0.05f)
+                                  : withinLimits("A", A, o.margin);
+    bool ok = a_ok & withinLimits("B", B, o.margin);
     if (!o.a_current && !withinLimits("Current", start, 0.f)) {
         std::cerr << "(current pose is outside URDF limits: calibration file probably does not "
                      "match this arm)\n";
