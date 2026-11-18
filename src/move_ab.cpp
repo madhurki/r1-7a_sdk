@@ -26,10 +26,16 @@
 #include <cmath>
 #include <csignal>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <poll.h>
+#include <unistd.h>
 
 namespace {
 
@@ -128,6 +134,10 @@ struct Options {
     bool one_way = false;    // go A -> B, hold at B until Ctrl-C, then return to A
     float gcomp = 0.f;       // gravity feed-forward scale (0 = off, 1 = full model)
     bool model_only = false; // print model gravity torques for --b and exit
+    std::string waypoints_path;  // one pose per line (7 rad); visited in order from the start pose
+    bool sync = false;           // after each waypoint print READY and wait for a line on stdin
+    int settle_ms = 1500;        // hold before measuring at each waypoint
+    std::vector<JointArray> waypoints;
 };
 
 void usage(const char* a0) {
@@ -149,6 +159,9 @@ void usage(const char* a0) {
         << "  --one-way         go A -> B and hold there; Ctrl-C returns smoothly to A\n"
         << "  --gcomp F         gravity compensation scale, 0..1.2 (default 0 = off; try 1.0)\n"
         << "  --model q0..q6    print the model's gravity torques at q and exit (no arm needed)\n"
+        << "  --waypoints FILE  visit each pose in FILE (7 rad per line, # comments), then return\n"
+        << "  --sync            at each waypoint print 'READY k q0..q6' and wait for Enter on stdin\n"
+        << "  --settle-ms N     hold time before measuring at each waypoint (default 1500)\n"
         << "Ctrl-C during a move or hold returns smoothly to A; press it again to release at once.\n";
 }
 
@@ -181,12 +194,40 @@ bool parse(int argc, char** argv, Options& o) {
         else if (s == "--rate" && v) o.rate_hz = std::stoi(argv[++i]);
         else if (s == "--hold-end") o.hold_end = true;
         else if (s == "--one-way") o.one_way = true;
+        else if (s == "--waypoints" && v) o.waypoints_path = argv[++i];
+        else if (s == "--sync") o.sync = true;
+        else if (s == "--settle-ms" && v) o.settle_ms = std::stoi(argv[++i]);
         else if (s == "--gcomp" && v) o.gcomp = std::stof(argv[++i]);
         else if (s == "--model") { if (!read7(i, argc, argv, o.b)) return false; o.model_only = true; }
         else { std::cerr << "Unknown/incomplete option: " << s << "\n"; usage(argv[0]); return false; }
     }
     if (o.model_only) return true;
     if (o.hand == 0) { std::cerr << "Need -r or -l\n"; return false; }
+    if (!o.waypoints_path.empty()) {
+        std::ifstream f(o.waypoints_path);
+        if (!f) { std::cerr << "Cannot open " << o.waypoints_path << "\n"; return false; }
+        std::string line;
+        int ln = 0;
+        while (std::getline(f, line)) {
+            ++ln;
+            const auto h = line.find('#');
+            if (h != std::string::npos) line.resize(h);
+            std::istringstream ss(line);
+            JointArray q{};
+            int n = 0;
+            while (n < kArmJointCount && ss >> q[n]) ++n;
+            if (n == 0) continue;
+            if (n != kArmJointCount) { std::cerr << o.waypoints_path << ":" << ln << ": need 7 numbers\n"; return false; }
+            o.waypoints.push_back(q);
+        }
+        if (o.waypoints.empty()) { std::cerr << "No poses in " << o.waypoints_path << "\n"; return false; }
+        if (!o.a_set) { o.a_current = true; o.a_set = true; }
+        o.b_set = true;
+        o.b = o.waypoints.back();
+        o.b_rel = false;
+        o.one_way = false;
+        o.settle_ms = std::max(200, o.settle_ms);
+    }
     if (!o.a_set || !o.b_set) { std::cerr << "Need --a and --b/--b-rel\n"; return false; }
     o.vmax = std::clamp(o.vmax, 0.01f, 1.0f);
     o.rate_hz = std::clamp(o.rate_hz, 20, 500);
@@ -329,6 +370,45 @@ int dwell(ArmMotorBus& bus, const Options& o, const JointArray& q, int ms) {
 }
 
 // Hold measured pose 0.5 s, then damping-only 1.5 s (gravity sinks slowly), then stop.
+// Hold q for n ticks and return the mean measured pose.
+int holdAverage(ArmMotorBus& bus, const Options& o, const JointArray& q, int n, JointArray& avg) {
+    const JointArray zero{}, ff = gff(o, q);
+    const auto period = std::chrono::microseconds(1000000 / o.rate_hz);
+    auto next = clock_t_::now();
+    avg = JointArray{};
+    for (int k = 0; k < n && g_running; ++k) {
+        sendCmd(bus, q, zero, o.kp, o.kd, ff);
+        if (faulted(bus)) return 1;
+        const JointArray m = measured(bus);
+        for (int i = 0; i < kArmJointCount; ++i) avg[i] += m[i] / n;
+        next += period;
+        std::this_thread::sleep_until(next);
+    }
+    return g_running ? 0 : 2;
+}
+
+// Hold q until a full line arrives on stdin. EOF counts as a request to stop (returns 2).
+int holdUntilLine(ArmMotorBus& bus, const Options& o, const JointArray& q) {
+    const JointArray zero{}, ff = gff(o, q);
+    const auto period = std::chrono::microseconds(1000000 / o.rate_hz);
+    auto next = clock_t_::now();
+    while (g_running) {
+        sendCmd(bus, q, zero, o.kp, o.kd, ff);
+        if (faulted(bus)) return 1;
+        pollfd pfd{STDIN_FILENO, POLLIN, 0};
+        if (poll(&pfd, 1, 0) > 0) {
+            char c;
+            const ssize_t r = ::read(STDIN_FILENO, &c, 1);
+            if (r <= 0) return 2;
+            if (c == '\n') return 0;
+            continue;  // keep draining the line without sleeping
+        }
+        next += period;
+        std::this_thread::sleep_until(next);
+    }
+    return 2;
+}
+
 void gentleRelease(ArmMotorBus& bus, const Options& o) {
     std::cout << "Release: hold, then damping-only, then stop\n";
     const JointArray zero{};
@@ -405,6 +485,8 @@ int main(int argc, char** argv) {
     const bool a_ok = o.a_current ? withinLimits("A (current pose)", A, -0.05f)
                                   : withinLimits("A", A, o.margin);
     bool ok = a_ok & withinLimits("B", B, o.margin);
+    for (size_t k = 0; k < o.waypoints.size(); ++k)
+        ok &= withinLimits(("waypoint " + std::to_string(k)).c_str(), o.waypoints[k], o.margin);
     if (!o.a_current && !withinLimits("Current", start, 0.f)) {
         std::cerr << "(current pose is outside URDF limits: calibration file probably does not "
                      "match this arm)\n";
@@ -438,9 +520,31 @@ int main(int argc, char** argv) {
     std::cout << "FOC enabled at current pose.\n";
 
     int rc = 0;
+    if (o.sync) std::cout << std::unitbuf;  // a parent process reads our output line by line
     if (!o.a_current) rc = segment(bus, o, start, A, "Current -> A");
     if (rc == 0) rc = dwell(bus, o, A, o.dwell_ms);
     JointArray last = A;
+    if (rc == 0 && !o.waypoints.empty()) {
+        JointArray prev = A;
+        for (size_t k = 0; rc == 0 && k < o.waypoints.size(); ++k) {
+            const std::string label = "  -> waypoint " + std::to_string(k);
+            rc = segment(bus, o, prev, o.waypoints[k], label.c_str());
+            if (rc == 0) rc = dwell(bus, o, o.waypoints[k], o.settle_ms);
+            JointArray avg{};
+            if (rc == 0) rc = holdAverage(bus, o, o.waypoints[k], 30, avg);
+            if (rc == 0) {
+                std::cout << "READY " << k << std::fixed << std::setprecision(5);
+                for (float x : avg) std::cout << " " << x;
+                std::cout << std::endl;
+                if (o.sync) rc = holdUntilLine(bus, o, o.waypoints[k]);
+            }
+            prev = o.waypoints[k];
+        }
+        if (rc == 0) {
+            rc = segment(bus, o, prev, A, "  -> start");
+            if (rc == 0) dwell(bus, o, A, 300);
+        }
+    }
     if (rc == 0 && o.one_way) {
         rc = segment(bus, o, A, B, "  A -> B");
         if (rc == 0) {
@@ -449,7 +553,7 @@ int main(int argc, char** argv) {
             rc = dwell(bus, o, B, -1);
         }
     }
-    for (int c = 0; !o.one_way && rc == 0 && c < o.cycles; ++c) {
+    for (int c = 0; o.waypoints.empty() && !o.one_way && rc == 0 && c < o.cycles; ++c) {
         std::cout << "Cycle " << c + 1 << "/" << o.cycles << "\n";
         rc = segment(bus, o, A, B, "  A -> B");
         if (rc == 0) { last = B; rc = dwell(bus, o, B, o.dwell_ms); }
